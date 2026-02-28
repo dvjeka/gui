@@ -1,0 +1,46 @@
+# /etc/sentinel/sentinel.yaml
+# SENTINEL OS KVM - Главный конфигурационный файл
+
+version: 2.0.0
+codename: "KVM ULTIMATE PRIVACY EDITION"
+
+kvm:
+  virtio_enabled: true
+  ksm_enabled: true
+  balloon_driver: true
+  cpu_pinning: false
+  hugepages: false
+
+resources:
+  memory_limit_mb: 2048
+  swap_limit_mb: 1024
+  cpu_quota: 100
+  io_weight: 500
+
+dns:
+  mode: "adguard"  # adguard, unbound, dnscrypt
+  upstream_dns:
+    - tls://1.1.1.1
+    - https://cloudflare-dns.com/dns-query
+  block_ads: true
+  block_trackers: true
+  dnssec: true
+
+protocols:
+  wireguard:
+    enabled: false
+    auto_start: false
+    settings:
+      interface: wg0
+      port: 51820
+      multiqueue: true
+      rx_queues: 4
+  
+  xray:
+    enabled: false
+    auto_start: false
+    memory_limit_mb: 512
+    settings:
+      protocol: vless
+      tcp_fastopen: true
+      bbr: true

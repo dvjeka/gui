@@ -1,0 +1,199 @@
+#!/bin/bash
+# sentinel-stealth-mode
+# SENTINEL OS KVM - Stealth Mode Script
+# Управление стелс-режимом через чистый nftables
+
+set -e
+
+CONFIG_DIR="/etc/sentinel/protection"
+NFTABLES_DIR="/etc/nftables.d"
+LOG_FILE="/var/log/sentinel-stealth.log"
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a $LOG_FILE
+}
+
+# Включение стелс-режима
+enable_stealth() {
+    local level=$1
+    log "Включение стелс-режима (уровень: $level)"
+    
+    # Создаем правила nftables
+    cat > $NFTABLES_DIR/40-stealth.nft << EOF
+# SENTINEL OS KVM - Stealth Mode Rules
+table inet stealth {
+    set trusted_ips {
+        type ipv4_addr
+        flags interval
+        elements = { 192.168.1.0/24, 127.0.0.1 }
+    }
+    
+    set knock_sequence {
+        type inet_service
+        flags constant
+    }
+    
+    chain input {
+        type filter hook input priority -50; policy drop;
+        
+        # Разрешаем trusted IP
+        ip saddr @trusted_ips accept
+        
+        # Разрешаем established соединения
+        ct state { established, related } accept
+        
+        # Разрешаем локальный трафик
+        iif "lo" accept
+EOF
+
+    case $level in
+        "basic")
+            cat >> $NFTABLES_DIR/40-stealth.nft << EOF
+        # Базовый режим - открытые порты
+        tcp dport { 22, 80, 443, 53 } accept
+        udp dport { 53, 51820, 1194 } accept
+EOF
+            ;;
+        "advanced")
+            cat >> $NFTABLES_DIR/40-stealth.nft << EOF
+        # Продвинутый режим - только необходимые
+        tcp dport { 22, 443 } accept
+        udp dport { 51820 } accept
+        
+        # SYN cookies
+        tcp flags syn tcp options \| synproxy
+EOF
+            ;;
+        "paranoid")
+            cat >> $NFTABLES_DIR/40-stealth.nft << EOF
+        # Параноидальный режим - минимум
+        tcp dport { 22 } accept
+        udp dport { 51820 } accept
+EOF
+            ;;
+    esac
+    
+    cat >> $NFTABLES_DIR/40-stealth.nft << EOF
+        
+        # Rate limiting
+        tcp flags syn limit rate 10/second accept
+        tcp flags syn drop
+    }
+    
+    # Port knocking (если включен)
+    chain knock {
+        type filter hook input priority -45; policy drop;
+        
+        # Здесь будут правила port knocking
+    }
+}
+EOF
+    
+    # Применяем правила
+    nft -f $NFTABLES_DIR/40-stealth.nft
+    
+    # Настройка sysctl для защиты
+    sysctl -w net.ipv4.tcp_syncookies=1
+    sysctl -w net.ipv4.tcp_syn_retries=2
+    sysctl -w net.ipv4.tcp_synack_retries=2
+    sysctl -w net.ipv4.tcp_max_syn_backlog=4096
+    
+    log "✅ Стелс-режим активирован"
+}
+
+# Отключение стелс-режима
+disable_stealth() {
+    log "Отключение стелс-режима"
+    
+    if nft list table inet stealth &>/dev/null; then
+        nft delete table inet stealth
+    fi
+    
+    rm -f $NFTABLES_DIR/40-stealth.nft
+    
+    # Восстанавливаем sysctl
+    sysctl -w net.ipv4.tcp_syncookies=0
+    
+    log "✅ Стелс-режим отключен"
+}
+
+# Port knocking setup
+setup_knock() {
+    local sequence=$1
+    local timeout=$2
+    local open_ports=$3
+    
+    log "Настройка port knocking: $sequence -> $open_ports"
+    
+    IFS=',' read -ra PORTS <<< "$sequence"
+    
+    # Создаем правила port knocking
+    cat > $NFTABLES_DIR/45-knock.nft << EOF
+table inet knock {
+    set knock_ports {
+        type inet_service
+        elements = { ${PORTS[@]} }
+    }
+    
+    chain input {
+        type filter hook input priority -40; policy drop;
+        
+        # Отслеживание последовательности
+        add @knock_track { ip saddr . tcp dport timeout ${timeout}s }
+        
+        # Проверка последовательности
+        ip saddr . tcp dport { ${PORTS[0]} } add @knock_stage1
+        ip saddr @knock_stage1 tcp dport { ${PORTS[1]} } add @knock_stage2
+        ip saddr @knock_stage2 tcp dport { ${PORTS[2]} } add @knock_stage3
+        
+        # Открытие портов при успешном knocking
+        ip saddr @knock_stage3 tcp dport { $open_ports } accept
+    }
+}
+EOF
+    
+    nft -f $NFTABLES_DIR/45-knock.nft
+    log "✅ Port knocking настроен"
+}
+
+# Статус
+show_status() {
+    echo "=== Стелс-режим статус ==="
+    
+    if nft list table inet stealth &>/dev/null; then
+        echo "✅ Активен"
+        echo ""
+        echo "Текущие правила:"
+        nft list table inet stealth
+    else
+        echo "❌ Неактивен"
+    fi
+}
+
+# CLI
+case "$1" in
+    start)
+        enable_stealth "${2:-advanced}"
+        ;;
+    stop)
+        disable_stealth
+        ;;
+    restart)
+        disable_stealth
+        sleep 1
+        enable_stealth "${2:-advanced}"
+        ;;
+    knock)
+        setup_knock "$2" "$3" "$4"
+        ;;
+    status)
+        show_status
+        ;;
+    *)
+        echo "Использование: $0 {start|stop|restart|knock|status} [level]"
+        echo "Уровни: basic, advanced, paranoid"
+        exit 1
+        ;;
+esac
+
+exit 0
